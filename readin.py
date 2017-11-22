@@ -1,3 +1,6 @@
+"""Script to read in ASASSN data"""
+
+
 import numpy as np
 import csv
 import os
@@ -7,12 +10,22 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tabulate import tabulate
 import os
+from scipy import optimize
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from ned import check_name, check_coordinate
+
+import lightcurve_model as lc
 
 user_dir = "/afs/ifh.de/user/s/steinrob/Desktop/python/ASASSN"
 
-threshold_n_points = 3
+threshold_n_points = 10
 
 class Database:
+    """
+    Class containing all the individual entries from the ASASSN data, as well
+    as matched information from NED regarding redshift/name.
+    """
 
     def __init__(self):
         self.data_path = "/afs/ifh.de/user/s/steinrob/scratch/ASASSN_data/"
@@ -32,10 +45,10 @@ class Database:
         self.combined_entries = dict()
         self.group_entries()
 
-        self.plot_histograms()
-
 
     def extract(self):
+        """Extracts the individual observations from the ASASSN data folders,
+        with observations grouped by day of detection."""
         for f in self.filenames:
             file_path = self.data_path + f
             with open(file_path, 'rb') as file:
@@ -50,15 +63,21 @@ class Database:
                     self.raw_entries.append((Observation(info)))
 
     def group_entries(self):
+        """Joins individual observations together to create
+        transient/variable histories. Currently groups each observation by the
+        name of its host galaxy, as determined by reference to NED."""
 
         for i, primary_entry in enumerate(self.raw_entries):
             points = []
             entries = []
-            name = primary_entry.galaxy_name
+            name = str(primary_entry.alias[-1])
             for j, secondary_entry in enumerate(self.raw_entries[i:]):
-                if secondary_entry.galaxy_name == name:
+                if str(secondary_entry.alias[-1]) == name:
                     points.append(j+i)
                     entries.append(secondary_entry)
+
+            # If an entry has not already been created, adds a new entry for
+            # the given NED name.
 
             if name not in self.combined_entries.keys():
                 new = Galaxy(points, entries, name)
@@ -81,23 +100,32 @@ class Database:
         print "In total, there are", self.n_interesting, "interesting objects."
 
     def plot_histograms(self):
-        attributes = ["n_entries"]
+        attributes = ["n_entries", "redshift", "NED_redshift"]
         data = [[] for i in attributes]
 
         for obj in self.combined_entries.values():
             for i, atr in enumerate(attributes):
-                data[i].append(getattr(obj, atr))
+                val = np.mean(getattr(obj, atr))
+                if not np.isnan(val):
+                    data[i].append(val)
 
-        binwidth = 1
         plt.figure()
         for j, dataset in enumerate(data):
             plt.subplot(len(data), 1, j+1)
-            plt.hist(dataset, bins=range(
-                min(dataset), max(dataset) + binwidth, binwidth))
+            plt.hist(dataset)
             plt.xlabel(attributes[j])
-            plt.yscale("log")
         plt.savefig(user_dir + "/plots/histogram.pdf")
         plt.close()
+
+    def plot_lightcurves(self):
+        for galaxy in self.combined_entries.itervalues():
+            if galaxy.interesting:
+                galaxy.make_lightcurve()
+
+    # def match_to_ned(self):
+    #     for galaxy in self.combined_entries.itervalues():
+    #         obs = galaxy.entries[0]
+    #         obs.add_ned()
 
 class Galaxy:
 
@@ -106,8 +134,14 @@ class Galaxy:
         self.entries = entries
         self.name = name
 
+        obs = self.entries[0]
+        self.NED_ra = obs.NED_ra
+        self.NED_dec = obs.NED_dec
+        self.NED_redshift = obs.NED_redshift
+
         dt = np.dtype([
             ('Galaxy Name', "S50"),
+            ('Alias', "S50"),
             ("Date", np.float),
             ("Field Image", "S50"),
             ("X Pixel", np.float),
@@ -132,17 +166,29 @@ class Galaxy:
 
         for i, obs in enumerate(self.entries):
             self.data_table[i] = np.array([
-                (obs.galaxy_name, float(str(obs.date)), str(obs.field_image),
-                 obs.xpixel, obs.ypixel, obs.ra, obs.dec, obs.galactic_l,
-                 obs.galactic_b, obs.n_up, obs.n_down, obs.rfc_score,
+                (obs.galaxy_name, str(obs.alias),
+                 float(str(obs.date)), str(obs.field_image),
+                 obs.xpixel, obs.ypixel, obs.ra.deg, obs.dec.deg,
+                 obs.galactic_l, obs.galactic_b, obs.n_up, obs.n_down,
+                 obs.rfc_score,
                  obs.sub_img_counts, obs.ref_img_counts, obs.offset_from_galaxy,
                  obs.redshift, obs.additional_info, obs.notes, obs.image_name)],
                 dtype=dt
             )
 
-        self.AGN = self.entries[0].AGN
+        self.AGN = obs.AGN
+
+        self.ra = self.data_table["RA"]
+        self.dec = self.data_table["Dec"]
+        self.redshift =self.data_table["Redshift"][~np.isnan(self.data_table["Redshift"])]
+
+        # print self.redshift, np.mean(self.redshift)
 
         self.n_entries = len(points)
+
+        self.model = np.nan
+        self.ll = np.nan
+        self.ll_per_dof = np.nan
 
         if self.n_entries > threshold_n_points:
             self.sufficient_points = True
@@ -151,29 +197,68 @@ class Galaxy:
 
         if self.sufficient_points and not self.AGN:
             self.interesting = True
-            self.make_lightcurve()
         else:
             self.interesting = False
 
-
     def print_output(self):
 
-        to_print = ["Date", "Redshift", "RA", "Dec", "Number Up", "Number Down",
+        to_print = ["Alias", "Date", "Redshift", "RA", "Dec", "Number Up",
+                    "Number Down",
                     "Offset From Galaxy", "Random Forest Classifier Score",
-                    "Notes"]
+                    "Image Name"]
 
-        if self.n_entries > 100 and not self.AGN:
-            print "\n", self.name, "\n"
-            print tabulate(self.data_table[to_print], to_print)
+        print "\n", self.name, "\n"
+        print tabulate(self.data_table[to_print], to_print)
 
     def make_lightcurve(self):
         fig = plt.figure()
         x = self.data_table["Date"]
         y = self.data_table["Subtracted Image Counts"]
-        err = np.sqrt(y) / self.data_table["Random Forest Classifier Score"]
+        err = np.sqrt(y) + 0.2 * y
+        weighted_err = err / self.data_table["Random Forest Classifier Score"]
         plt.errorbar(x, y, yerr=err, fmt="o", ecolor="r")
         plt.xlabel("Date (MJD)")
         plt.ylabel("Subtracted Image Counts")
+
+        max_count = max(y)
+        max_index = list(y).index(max_count)
+        max_time = self.data_table["Date"][max_index]
+        pinit = lc.default(max_count)
+
+        def llh_weighted(p):
+            time = x - max_time
+            model = lc.fitfunc(time, p)
+            ll = np.sum(((y-model)/weighted_err) ** 2)
+            return ll
+
+        def llh(p):
+            time = x - max_time
+            model = lc.fitfunc(time, p)
+            ll = np.sum(((y-model)/err) ** 2)
+            return ll
+
+
+        out = optimize.minimize(
+            llh_weighted, pinit, method='L-BFGS-B',
+            bounds=lc.return_loose_bounds())
+
+        self.ll = np.sum(out.fun)
+
+        self.ll_per_dof = self.ll / (
+            float(self.n_entries) - len(pinit))
+
+        self.model = out.x
+        plot_x = np.linspace(min(x), max(x), 100)
+        plot_y = lc.fitfunc(plot_x - max_time, self.model)
+        plt.plot(plot_x, plot_y)
+        plt.annotate("ll per dof = " + str(self.ll_per_dof) + "\n" +
+                     str(llh(self.model)/ (float(self.n_entries) - len(
+                         pinit))),
+                     xy=(0.8, 0.8),
+                     xycoords="axes fraction")
+
+        # except ValueError:
+        #     print "Failed to fit!"
 
         dir = "plots/objects/" + str(self.n_entries) + "/" + self.name
         if not os.path.isdir(dir):
@@ -191,8 +276,11 @@ class Observation:
         self.field_image = info[1].split("/")
         self.xpixel = float(info[2])
         self.ypixel = float(info[3])
-        self.ra = float(info[4])
-        self.dec = float(info[5])
+
+        self.coords = SkyCoord(info[4] + " " + info[5], unit=(u.deg, u.deg))
+        self.ra = self.coords.ra
+        self.dec = self.coords.dec
+
         self.galactic_l = float(info[6])
         self.galactic_b = float(info[7])
         self.n_up = int(info[8])
@@ -202,23 +290,41 @@ class Observation:
         self.ref_img_counts = int(info[12])
         self.offset_from_galaxy = float(info[13])
 
-        g_name = info[14].strip(":")
-        if "AGN" in g_name:
-            self.galaxy_name = g_name[:-3]
-            self.AGN = True
-        else:
-            self.galaxy_name = g_name
-            self.AGN = False
-
         self.redshift = np.nan
+
+        g_name = info[14].strip(":")
 
         extra_info = info[15].split("(")
 
-        if extra_info[1][0] not in ["-", "z"] \
-                and not extra_info[1][0].isdigit():
+        if extra_info[0] == 'APMUKS':
             rest = extra_info[2:]
-            extra_info = ["(".join(extra_info[:2])]
-            extra_info.extend(rest)
+            stripped_info = ["(".join(extra_info[:2])]
+            stripped_info.extend(rest)
+        else:
+            stripped_info = extra_info
+
+        if "AGN" in g_name:
+            name = g_name[:-3]
+            self.AGN = True
+        else:
+            name = g_name
+            self.AGN = False
+
+        if "AGN" in stripped_info[0]:
+            stripped_info[0] = stripped_info[0][:-3]
+            self.AGN = True
+
+        if stripped_info[0] != name:
+
+            if name.split("(")[0] == stripped_info[0]:
+                self.alias = [stripped_info[0]]
+            else:
+                self.alias = [ x for x in [stripped_info[0], name]
+                               if x != 'sdssgal']
+        else:
+            self.alias = [name]
+
+        self.galaxy_name = self.alias[0]
 
         for i, x in enumerate(extra_info):
             if i == 0:
@@ -238,4 +344,82 @@ class Observation:
         self.notes = info[16]
         self.image_name = info[17]
 
-Database()
+        self.NED_ra = np.nan
+        self.NED_dec = np.nan
+        self.NED_redshift = np.nan
+        self.NED_name = np.nan
+
+        self.add_ned()
+
+    def add_ned(self):
+
+        if not isinstance(self.NED_name, str):
+            best = None
+
+            for name in self.alias:
+                entry = check_name(name)
+                if entry is not None:
+                    if best is None:
+                        best = entry["data_table"]
+                    else:
+                        if best["Object Name"] == \
+                                entry["data_table"]["Object Name"]:
+                            pass
+                        else:
+                            pass
+                            # print self.alias
+                            # print best
+                            # print entry["data_table"]
+                            # raise Exception("Conflict with aliases. Each matches "
+                            #                 "to a different object!")
+
+                    if len(best) > 1:
+                        raise Exception("Too many entries")
+
+            entry = check_coordinate(self.ra.deg, self.dec.deg)
+            if entry is not None:
+                try:
+                    new = entry["data_table"][entry["mask"]][0]
+                    if best is not None:
+                        if best["Object Name"] != new["Object Name"]:
+                            name_mask = entry["data_table"]["Object Name"] == \
+                                        best["Object Name"]
+
+                            alt = entry["data_table"][name_mask]
+
+                            if len(alt) == 1:
+                                best = alt
+                            else:
+                                check =[
+                                x for x in entry["data_table"]["Object Name"]
+                                if any(y.replace(" ", "") in x.replace(" ", "")
+                                for y in self.alias)]
+
+                                if len(check) > 0:
+
+                                    best = entry["data_table"][
+                                        entry["data_table"]["Object Name"] ==
+                                        check[0]]
+                                else:
+                                    best = new
+                                # print check
+                                # print self.alias, self.offset_from_galaxy
+                                # print self.ra.deg, self.dec.deg
+                                # print new
+                                # print best
+                                # print alt
+                                # print name_mask
+                                # print entry["data_table"]
+                                # raise Exception("Conflict between ra/dec object and name")
+                        else:
+                            best = new
+                except IndexError:
+                    pass
+
+
+            if best is not None:
+                self.alias.append(best["Object Name"])
+                self.NED_name = str(best["Object Name"])
+                self.NED_ra = float(best["RA(deg)"])
+                self.NED_dec = float(best["DEC(deg)"])
+                self.NED_redshift = float(best["Redshift"])
