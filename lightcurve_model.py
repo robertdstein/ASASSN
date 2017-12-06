@@ -1,6 +1,6 @@
 import numpy as np
 
-def default(max_y):
+def default(max_y=1):
     """Returns an array with typical values for each fit parameter,
     lying well within the strict parameter bounds
 
@@ -15,9 +15,8 @@ def return_loose_bounds():
 
     :return: Array containing bounds for parameters
     """
-    return[(None,None), (10**-6, None), (2., 350),
+    return[(None,None), (10**-6, None), (1., 350),
            (None, -10**-6), (None, None)]
-
 
 def logpeak(x, p):
     """Returns a value for the peak part of the lightcurve, which is a

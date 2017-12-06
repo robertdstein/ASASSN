@@ -7,6 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-r", "--reset", action="store_true")
 parser.add_argument("-p", "--plot", action="store_true")
 parser.add_argument("-n", "--ned", action="store_true")
+parser.add_argument("-o", "--output", action="store_true")
 
 cfg = parser.parse_args()
 
@@ -22,8 +23,12 @@ else:
     joblib.dump(data, pickle_path)
 
 if cfg.plot:
-    data.plot_lightcurves()
+    data.galaxy_plots()
     data.plot_histograms()
+    data.plot_skymap()
+
+if cfg.output:
+    data.print_interesting()
 
 # if cfg.ned:
 #     data.match_to_ned()

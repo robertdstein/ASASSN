@@ -7,8 +7,6 @@ import numpy as np
 import time
 
 data_dir = "/afs/ifh.de/user/s/steinrob/scratch/ASASSN_NED"
-
-reset = True
 # reset = False
 
 names_directory = data_dir + "/names/"
